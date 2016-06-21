@@ -503,6 +503,13 @@ MStatus AlembicExportCommand::doIt(const MArgList &args)
       bool useInitShadGrp = false;
       bool useOgawa = false;  // Later, will need to be changed!
 
+      // Each frames to export can manually be specified via the "frames" parameter.
+      // This allow for very specific frames to be exported.
+      // In our case (Squeeze Studio) this allow the animator to export only specific subframes.
+      // The advantage of exporting specific subframes instead of using the "substep" parameter is that the animator don't have to
+      // fix all the flipping occuring in a rig when trying to work with substeps.
+      MDoubleArray frames;
+
       MStringArray objectStrings;
       std::vector<std::string> prefixFilters;
       std::set<std::string> attributes;
@@ -583,6 +590,16 @@ MStatus AlembicExportCommand::doIt(const MArgList &args)
         }
         else if (lowerValue == "ogawa") {
           useOgawa = valuePair[1].asInt() != 0;
+        }
+        else if(lowerValue == "frames")
+        {
+          MStringArray strFrames;
+          valuePair[1].split(',', strFrames);
+          for(unsigned int i=0;i<strFrames.length();i++)
+          {
+            double frame = strFrames[i].asDouble();
+            frames.append(frame);
+          }
         }
         else if (lowerValue == "attrprefixes") {
           splitListArg(valuePair[1], prefixFilters);
@@ -722,8 +739,8 @@ MStatus AlembicExportCommand::doIt(const MArgList &args)
         return MStatus::kFailure;
       }
 
-      // construct the frames
-      MDoubleArray frames;
+      // construct the frames if they are not already provided
+      if (frames.length() == 0)
       {
         const double frameIncr = frameSteps / frameSubSteps;
         for (double frame = frameIn; frame <= frameOut; frame += frameIncr) {
@@ -792,8 +809,10 @@ MStatus AlembicExportCommand::doIt(const MArgList &args)
     // now, let's run through all frames, and process the jobs
     const double frameRate = MTime(1.0, MTime::kSeconds).as(MTime::uiUnit());
     const double incrSteps = maxSteps / maxSubsteps;
+    double frame;
     double nextFrame = minFrame + incrSteps;
 
+    /*
     for (double frame = minFrame; frame <= maxFrame;
          frame += incrSteps, nextFrame += incrSteps) {
       MAnimControl::setCurrentTime(MTime(frame / frameRate, MTime::kSeconds));
@@ -815,6 +834,56 @@ MStatus AlembicExportCommand::doIt(const MArgList &args)
                          curMinTime, curMaxTime);
           return status;
         }
+      }
+      AlembicCurveAccumulator::StopRecordingFrame();
+    }
+    */
+    // Collect all job frames
+    std::vector<double> all_frames;
+    for(size_t i=0;i<jobPtrs.size();i++)
+    {
+      const std::vector<double> jobFrames = jobPtrs[i]->GetFrames();
+      for (unsigned int j=0;j<jobFrames.size();++j)
+      {
+        all_frames.push_back(jobFrames[j]);
+      }
+    }
+
+    // Force Maya to play the animation in sequence. This way particles are updated.
+    unsigned int num_frames_to_export = all_frames.size();
+    all_frames.push_back(all_frames[num_frames_to_export -1] + incrSteps);
+    for (unsigned int i=0;i<num_frames_to_export;++i)
+    {
+      frame = all_frames[i];
+      nextFrame = all_frames[i+1];
+
+      // debuging
+      MString msg = "Exporting frame ";
+      msg += frame;
+      msg += ". Next is ";
+      msg += nextFrame;
+      MGlobal::displayInfo(msg);
+
+      MAnimControl::setCurrentTime(MTime(frame/frameRate,MTime::kSeconds));
+      MAnimControl::setAnimationEndTime( MTime(nextFrame/frameRate,MTime::kSeconds) );
+      MAnimControl::playForward();  // this way, it forces Maya to play exactly one frame! and particles are updated!
+
+      AlembicCurveAccumulator::StartRecordingFrame();
+      for(size_t i=0;i<jobPtrs.size();i++)
+      {
+        MStatus status = jobPtrs[i]->Process(frame);
+        if(status != MStatus::kSuccess)
+        {
+          MGlobal::displayError("[ExocortexAlembic] Job aborted :"+jobPtrs[i]->GetFileName());
+          for(size_t k=0;k<jobPtrs.size();k++)
+          {
+            delete(jobPtrs[k]);
+          }
+
+          restoreOldTime(currentAnimStartTime, currentAnimEndTime, oldCurTime, curMinTime, curMaxTime);
+          return status;
+        }
+
       }
       AlembicCurveAccumulator::StopRecordingFrame();
     }
